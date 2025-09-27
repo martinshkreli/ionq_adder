@@ -1,9 +1,12 @@
 # ionq_adder
 Adding numbers on IONQ Forte
 
-You have 8 qubits to work with. Have fun adding!
+2k + 1 < 36
+2k < 35
+k = 35/2
+k < 18
 
-4k + 1 < 36
-4k < 35
-k = 35/4
-k < 9
+17 bit addition
+
+Furthermore the information is classically separable, leading  to a hybrid classical-quantum architecture. Classical memory can store intermediary and final results for arbitrary N-bit number addition using an arbitrary amount of classical memory. 
+
