@@ -12,7 +12,7 @@ def run_on_aws_braket(a, b, device_arn="", shots=1000):
 
     qc = QuantumCircuit(QuantumRegister(1, 'cin'), QuantumRegister(k, 'a'),
                         QuantumRegister(k, 'b'), QuantumRegister(1, 'cout'),
-                        ClassicalRegister(k+1, 'res'))
+                        ClassicalRegister(2*k+2, 'res'))
 
     for i in range(k):
         if (a >> i) & 1: qc.x(qc.qregs[1][i])
