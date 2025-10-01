@@ -1,134 +1,98 @@
-# Forte-Enterprise-1 friendly adder with a separate SUM register (correct logic)
-# Qubits used: ~4k + 1 (a[k] + b[k] + c[k+1] + s[k])
+from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister, transpile
+from qiskit.circuit.library import CDKMRippleCarryAdder
+from qiskit_braket_provider import AWSBraketBackend
+from braket.aws import AwsDevice
+import random
+import os
 
-from braket.aws import AwsDevice, AwsSession
-from braket.circuits import Circuit
-from collections import Counter
-
-# --- Helpers ---
-def int_to_bits_le(x: int, width: int):
-    return [(x >> i) & 1 for i in range(width)]
-
-def ccx_decomposed(circ: Circuit, a: int, b: int, t: int) -> Circuit:
-    """
-    Toffoli (CCX) using only {H,S,Si,T,Ti,CNOT}.
-    Controls: a, b ; target: t
-    """
-    circ.h(t)
-    circ.cnot(b, t);  circ.ti(t)
-    circ.cnot(a, t);  circ.t(t)
-    circ.cnot(b, t);  circ.ti(t)
-    circ.cnot(a, t);  circ.t(b);  circ.t(t)
-    circ.h(t)
-    circ.cnot(a, b);  circ.t(a);  circ.si(b);  circ.cnot(a, b)
-    return circ
-
-def full_adder(a: int, b: int, cin: int, s: int, cout: int) -> Circuit:
-    """
-    Full adder with SEPARATE sum qubit `s`:
-      s   ^= a
-      s   ^= b                 # s = a XOR b
-      cout ^= a & b
-      cout ^= cin & s          # uses s = (a XOR b)
-      s   ^= cin               # s = a XOR b XOR cin
-    """
-    c = Circuit()
-    c.cnot(a, s)
-    c.cnot(b, s)
-    ccx_decomposed(c, a, b, cout)
-    ccx_decomposed(c, cin, s, cout)
-    c.cnot(cin, s)
-    return c
-
-def build_adder_circuit(a_val: int, b_val: int):
-    if a_val < 0 or b_val < 0:
-        raise ValueError("Only non-negative integers are supported.")
-    k = max(1, max(a_val.bit_length(), b_val.bit_length()))
-
-    # Layout (contiguous):
-    #   a[0..k-1], b[0..k-1], c[0..k], s[0..k-1]
-    a_off = 0
-    b_off = a_off + k
-    c_off = b_off + k
-    s_off = c_off + (k + 1)
-
-    a_idx = [a_off + i for i in range(k)]
-    b_idx = [b_off + i for i in range(k)]
-    c_idx = [c_off + i for i in range(k + 1)]
-    s_idx = [s_off + i for i in range(k)]
-
-    circ = Circuit()
-
-    # Initialize |a>, |b| (little-endian within registers)
-    for i, bit in enumerate(int_to_bits_le(a_val, k)):
-        if bit: circ.x(a_idx[i])
-    for i, bit in enumerate(int_to_bits_le(b_val, k)):
-        if bit: circ.x(b_idx[i])
-
-    # k stages
+def run_on_aws_braket(a, b, device_arn="", shots=100):
+    k = max(a.bit_length(), b.bit_length())
+    print(f"Computing {a} + {b}")
+    print(f"Bit width: {k} bits (sum needs {(a+b).bit_length()} bits)")
+    
+    # Half mode: 2*k + 2 qubits (a, b, cout, and 1 ancilla)
+    qc = QuantumCircuit(QuantumRegister(k, 'a'),
+                        QuantumRegister(k, 'b'),
+                        QuantumRegister(1, 'cout'),
+                        QuantumRegister(1, 'ancilla'),
+                        ClassicalRegister(2*k+2, 'res'))
+    
+    # Initialize inputs
     for i in range(k):
-        circ += full_adder(a_idx[i], b_idx[i], c_idx[i], s_idx[i], c_idx[i+1])
-
-    # --- Forte requires ALL used qubits be measured ---
-    # Order: a, b, c, s (so decoding is straightforward)
-    measure_order = a_idx + b_idx + c_idx + s_idx
-    for q in measure_order:
-        circ.measure(q)
-
-    meta = {"k": k, "a": a_idx, "b": b_idx, "c": c_idx, "s": s_idx, "measure_order": measure_order}
-    return circ, meta
-
-def decode_sum(counts: Counter, measured_qubits: list[int], meta: dict) -> int:
-    """
-    Choose the most frequent outcome; map bits onto qubits;
-    extract SUM from s[0..k-1] and final carry c[k].
-    Braket bitstrings align left-to-right with measured_qubits order.
-    """
-    if not counts:
-        raise RuntimeError("No counts returned.")
-    bitstr, _ = max(counts.items(), key=lambda kv: kv[1])
-    bits_by_q = {measured_qubits[i]: int(bitstr[i]) for i in range(len(measured_qubits))}
-    k = meta["k"]
-    # sum = Σ s[i] << i  +  (carry << k)
-    sum_low = 0
-    for i, q in enumerate(meta["s"]):
-        sum_low |= bits_by_q[q] << i
-    carry = bits_by_q[meta["c"][-1]]
-    return sum_low + (carry << k)
-
-def run_ionq_adder(
-    a: int,
-    b: int,
-    device_arn: str = "arn:aws:braket:us-east-1::device/qpu/ionq/Forte-Enterprise-1",
-    shots: int = 1000,
-    s3_bucket: str | None = None,
-    s3_prefix: str = "ionq-adder/results",
-):
-    k = max(1, max(a.bit_length(), b.bit_length()))
-    qubits_needed = 4 * k + 1
-    print(f"Inputs: a={a}, b={b} | k={k} | qubits ≈ {qubits_needed}")
-
-    circ, meta = build_adder_circuit(a, b)
-
-    aws_sess = AwsSession()
-    bucket = s3_bucket or aws_sess.default_bucket()
-    s3_folder = (bucket, s3_prefix)
-
+        if (a >> i) & 1: qc.x(qc.qregs[0][i])
+        if (b >> i) & 1: qc.x(qc.qregs[1][i])
+    
+    # Use 'half' mode (no cin, but has cout for overflow)
+    qc.append(CDKMRippleCarryAdder(k, 'half'), qc.qubits)
+    
+    # Measure result bits (b register contains the sum)
+    for i in range(k): 
+        qc.measure(qc.qregs[1][i], qc.cregs[0][i])
+    
+    # Measure cout (overflow bit)
+    qc.measure(qc.qregs[2][0], qc.cregs[0][k])
+    
+    # Measure ancilla
+    qc.measure(qc.qregs[3][0], qc.cregs[0][k+1])
+    
+    # Measure remaining qubits (a register)
+    for i in range(k): 
+        qc.measure(qc.qregs[0][i], qc.cregs[0][k+2+i])
+    
+    print(f"Circuit uses {qc.num_qubits} qubits")
+    print(f"Circuit depth: {qc.depth()}")
+    
+    print(f"\nConnecting to device: {device_arn.split('/')[-1]}")
     device = AwsDevice(device_arn)
-    print(f"Submitting to {device_arn} | shots={shots} | s3://{bucket}/{s3_prefix}")
-    task = device.run(circ, shots=shots, s3_destination_folder=s3_folder)
-    print("Task ID:", task.id, "(waiting...)")
-    result = task.result()
+    backend = AWSBraketBackend(device=device)
+    
+    print("Transpiling circuit for backend...")
+    transpiled_qc = transpile(qc, backend=backend, optimization_level=1)
+    print(f"Transpiled circuit depth: {transpiled_qc.depth()}")
+    
+    print(f"Submitting job with {shots} shots...")
+    job = backend.run(transpiled_qc, shots=shots)
+    print(f"Job ID: {job.job_id()}")
+    print("Waiting for results...")
+    result = job.result()
+    
+    counts = result.get_counts()
+    
+    # Extract the first k+1 bits (k bits for sum + 1 bit for overflow)
+    result_counts = {}
+    for bitstring, count in counts.items():
+        result_bits = bitstring[-(k+1):]  # Last k+1 bits: sum + cout
+        result_counts[result_bits] = result_counts.get(result_bits, 0) + count
+    
+    most_common = max(result_counts, key=result_counts.get)
+    quantum_sum = int(most_common, 2)
+    
+    # Check overflow
+    overflow_bit = int(most_common[0])  # First bit is cout
+    sum_value = int(most_common[1:], 2)  # Remaining bits are the sum
+    
+    print(f"\n=== Results ===")
+    print(f"Classical sum: {a + b}")
+    print(f"Quantum sum: {quantum_sum} ({'✓' if quantum_sum == a+b else '✗'})")
+    print(f"Overflow detected: {'YES' if overflow_bit else 'NO'} (cout={overflow_bit})")
+    print(f"Sum value (without overflow): {sum_value}")
+    print(f"Confidence: {result_counts[most_common]}/{shots} = {result_counts[most_common]/shots:.1%}")
+    print(f"Unique outcomes: {len(result_counts)} (noise: {'yes' if len(result_counts) > 1 else 'no'})")
+    
+    if len(result_counts) > 5:
+        print("\nTop 5 outcomes:")
+        sorted_counts = sorted(result_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        for bitstring, count in sorted_counts:
+            decimal = int(bitstring, 2)
+            overflow = int(bitstring[0])
+            error = abs(decimal - (a+b))
+            print(f"  {decimal:4d} (overflow={overflow}, error: {error:3d}): {count:3d} times")
+    
+    return quantum_sum, result
 
-    print("\n=== Raw ===")
-    print("measured_qubits:", result.measured_qubits)
-    print("counts:", result.measurement_counts)
-
-    qsum = decode_sum(result.measurement_counts, result.measured_qubits, meta)
-    print("\n=== Decoded ===")
-    print(f"quantum sum = {qsum} | classical sum = {a + b}")
-    print("MATCH" if qsum == a + b else "MISMATCH")
-    return qsum, result
-
-a, b = 553, 452
-qsum, res = run_ionq_adder(a, b)
+# Main execution
+if __name__ == "__main__":
+    a = random.randint(100000, 131072)
+    b = random.randint(100000, 131072)
+    device_arn = "arn:aws:braket:us-east-1::device/qpu/ionq/Forte-Enterprise-1"
+    quantum_sum, result = run_on_aws_braket(a, b, device_arn=device_arn, shots=100)
