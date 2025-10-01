@@ -1,10 +1,9 @@
 # ionq_adder
-Adding numbers on IONQ Forte
+Adding numbers on IONQ Forte using a [standard qiskit ripple carry adder](https://quantum.cloud.ibm.com/docs/en/api/qiskit/qiskit.circuit.library.CDKMRippleCarryAdder) 
 
-2k + 1 < 36
-2k < 35
-k = 35/2
-k < 18
+2k + 2 = 36
+2k = 34
+k = 17
 
 17 bit addition
 
